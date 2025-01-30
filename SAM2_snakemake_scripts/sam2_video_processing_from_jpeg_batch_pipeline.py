@@ -432,8 +432,6 @@ def main(args):
     # e dictionary by the global frame index (just in case)
     sorted_mask_keys = sorted(final_mask_dict.keys())
 
-    # Sort the dictionary by the global frame index
-    sorted_mask_keys = sorted(final_mask_dict.keys())
     print(f"Total number of masks in final_mask_dict: {len(sorted_mask_keys)}")
     print(f"Frame indices covered: from {min(sorted_mask_keys)} to {max(sorted_mask_keys)}")
 
