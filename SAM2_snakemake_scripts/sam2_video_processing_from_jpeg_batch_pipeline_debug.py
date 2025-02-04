@@ -180,115 +180,200 @@ def create_frames_directory(video_path, batch_size):
     
     return frames_dir, batch_frame_counts
 
+
+def check_image_folder(video_path, batch_size):
+    """
+    Check if folder has enough frames, retry for up to 10 minutes.
+    """
+    import time
+
+    max_wait_time = 600  # 10 minutes in seconds
+    elapsed_time = 0
+    wait_interval = 10  # wait 10 seconds between checks
+
+    while elapsed_time < max_wait_time:
+        frame_count = len([f for f in os.listdir(video_path) if f.lower().endswith(('.jpg', '.jpeg'))])
+
+        if frame_count >= batch_size:
+            return True
+
+        print(f"Found {frame_count}/{batch_size} frames. Waiting 10 seconds... (Total wait: {elapsed_time} seconds)")
+        time.sleep(wait_interval)
+        elapsed_time += wait_interval
+
+    raise RuntimeError("Failed to generate image folders: Timeout after 10 minutes waiting for frames")
+
 def segment_object(predictor, video_path, coordinate, frame_number, batch_number, batch_size):
+    print("\n=== Starting segment_object function ===")
+    print(f"Batch Folder Path (video_path): {video_path}")
+    print(f"Frame number: {frame_number}")
+    print(f"Batch number: {batch_number}")
+    print(f"Batch size: {batch_size}")
+    print(f"Coordinate keys: {list(coordinate.keys())}")
+    print(f"Full coordinate data: {coordinate}")
 
-    print("Batch Folder Path", video_path)
+    # Check if video_path is a non-empty string
+    if not isinstance(video_path, str) or not video_path.strip():
+        print("ERROR: Provided video_path is invalid or empty.")
+    else:
+        print("DEBUG: video_path appears valid.")
 
-    print(f"Generating masklet for coordinate {coordinate} on frame {frame_number}")
+    # Check if coordinate is a non-empty dict with proper format (keys mapping to list of (x,y) tuples)
+    if not isinstance(coordinate, dict) or not coordinate:
+        print("ERROR: Provided coordinate is invalid or empty.")
+    else:
+        for key, points in coordinate.items():
+            if not isinstance(points, list) or not all(isinstance(pt, (list, tuple)) and len(pt) == 2 for pt in points):
+                print(f"ERROR: Coordinate for '{key}' is not in the expected format.")
+            else:
+                print(f"DEBUG: Coordinate for '{key}' is valid with {len(points)} point(s).")
 
-    #model only sees 1 batch as whole video
+    print(f"\nGenerating masklet for coordinate {coordinate} on frame {frame_number}")
+
+    # model only sees 1 batch as whole video
     normalized_frame_number = frame_number - (batch_number * batch_size)
-    print("Normalized Framenumber for Batch:", normalized_frame_number)
+    print(f"Normalized Frame Number for Batch: {normalized_frame_number}")
 
-     # Initialize lists to hold points and labels
+    # Initialize lists to hold points and labels
     points_list = []
     labels_list = []
-    
-    # Iterate over each key (e.g., 'vulva', 'neck') in the coordinate dictionary
+
+    print("\n=== Processing coordinates ===")
+    # Iterate over each key in the coordinate dictionary
     for key in coordinate:
+        print(f"Processing bodypart: {key}")
         # Iterate over each (x, y) tuple in the list associated with the key
         for (x, y) in coordinate[key]:
             points_list.append([x, y])
-            labels_list.append(1)  # You can customize the label as needed
+            labels_list.append(1)
+            print(f"Added point: ({x}, {y}) for {key}")
 
     # Convert the lists to NumPy arrays
+    import numpy as np  # Ensure numpy is imported
     points = np.array(points_list, dtype=np.float32)
     labels = np.array(labels_list, dtype=np.int32)
-    
-    # Now you can use 'points' and 'labels' as needed
-    print("Points array:", points)
-    print("Labels array:", labels)
 
-    # Initialize inference state
-    inference_state = predictor.init_state(video_path=video_path)
-    print("Initialized inference state")
+    print("\n=== Points and Labels Information ===")
+    print(f"Points array shape: {points.shape}")
+    print(f"Points dtype: {points.dtype}")
+    print(f"Points:\n{points}")
+    print(f"Labels array shape: {labels.shape}")
+    print(f"Labels:\n{labels}")
 
-    # Add points to model and get mask logits
-    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-        inference_state=inference_state,
-        frame_idx=normalized_frame_number,
-        obj_id=0,
-        points=points,
-        labels=labels,
-    )
-    
-    print("Added point to the model")
+    print("\n=== Checking Image Folder ===")
+    try:
+        check_image_folder(video_path, batch_size)
+        print("Image folder check passed successfully")
+    except RuntimeError as e:
+        print(f"ERROR in image folder check: {str(e)}")
+        raise
+
+    print("\n=== Initializing Inference State ===")
+    print(f"DEBUG: Initializing model with video_path: {video_path}")
+    try:
+        inference_state = predictor.init_state(video_path=video_path)
+        print("Inference state initialized successfully")
+        # Print the initial inference state for debugging
+        print("DEBUG: Initial Inference State:")
+        print(inference_state)
+    except Exception as e:
+        print(f"ERROR initializing inference state: {str(e)}")
+        raise
+
+    print("\n=== Adding Points to Model ===")
+    try:
+        _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=normalized_frame_number,
+            obj_id=0,
+            points=points,
+            labels=labels,
+        )
+        print("Points added to model successfully")
+        print(f"Model outputs:")
+        print(f"out_obj_ids: {out_obj_ids}")
+        print(f"out_mask_logits shape: {out_mask_logits.shape}")
+        print(f"out_mask_logits dtype: {out_mask_logits.dtype}")
+        print(f"out_mask_logits min/max: {out_mask_logits.min():.4f}/{out_mask_logits.max():.4f}")
+        print(f"out_mask_logits mean/std: {out_mask_logits.mean():.4f}/{out_mask_logits.std():.4f}")
+    except Exception as e:
+        print(f"ERROR adding points to model: {str(e)}")
+        raise
 
     # Dictionary to store masks for video frames
     video_segments = {}
-    print("Propagating masklet through video frames (forward direction):")
+    print("\n=== Starting Forward Propagation ===")
 
     # Forward propagation (reverse=False)
+    mask_count = 0
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=False):
+        print(f"\nFrame {out_frame_idx} model outputs:")
+        print(f"out_obj_ids: {out_obj_ids}")
+        print(f"out_mask_logits shape: {out_mask_logits.shape}")
+        print(f"out_mask_logits dtype: {out_mask_logits.dtype}")
+        print(f"out_mask_logits min/max: {out_mask_logits.min():.4f}/{out_mask_logits.max():.4f}")
+        print(f"out_mask_logits mean/std: {out_mask_logits.mean():.4f}/{out_mask_logits.std():.4f}")
+
         for i, out_obj_id in enumerate(out_obj_ids):
             # Generate mask from logits
             mask = (out_mask_logits[i] > 0.0).cpu().numpy()
-
-            # Remove the extra channel dimension if present
             mask = np.squeeze(mask)
-            
-            # Check if the mask is 2D (binary mask) and proceed
-            if len(mask.shape) == 2:
-                # Convert mask to binary (0 or 255)
-                binary_mask = (mask * 255).astype(np.uint8)
-                
-                # Show unique values and shape of the binary mask
-                print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
-                
-                # Add the binary mask to video_segments (no second key, just out_frame_idx)
-                video_segments[out_frame_idx] = binary_mask
-                print(f"Processed frame {out_frame_idx}")
-            else:
-                # Create a black mask (all zeros) with the same width and height as the original mask
-                black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
-                
-                # Add the black mask to video_segments (no second key)
-                video_segments[out_frame_idx] = black_mask
-                print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
 
-    # Reverse propagation (reverse=True)
-    print("Propagating masklet through video frames (reverse direction):")
+            print(f"\nProcessing frame {out_frame_idx}")
+            print(f"Mask shape: {mask.shape}")
+
+            if len(mask.shape) == 2:
+                binary_mask = (mask * 255).astype(np.uint8)
+                unique_vals = np.unique(binary_mask)
+                print(f"Binary mask unique values: {unique_vals}")
+                print(f"Binary mask shape: {binary_mask.shape}")
+
+                video_segments[out_frame_idx] = binary_mask
+                mask_count += 1
+            else:
+                print(f"WARNING: Non-2D mask detected for frame {out_frame_idx}")
+                black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
+                video_segments[out_frame_idx] = black_mask
+
+    print(f"\nForward propagation complete. Generated {mask_count} masks.")
+    print("\n=== Starting Reverse Propagation ===")
+
+    # Reverse propagation code (similar debug statements...)
+    mask_count = 0
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=True):
+        print(f"\nFrame {out_frame_idx} model outputs (reverse):")
+        print(f"out_obj_ids: {out_obj_ids}")
+        print(f"out_mask_logits shape: {out_mask_logits.shape}")
+        print(f"out_mask_logits dtype: {out_mask_logits.dtype}")
+        print(f"out_mask_logits min/max: {out_mask_logits.min():.4f}/{out_mask_logits.max():.4f}")
+        print(f"out_mask_logits mean/std: {out_mask_logits.mean():.4f}/{out_mask_logits.std():.4f}")
+
         for i, out_obj_id in enumerate(out_obj_ids):
-            # Generate mask from logits
             mask = (out_mask_logits[i] > 0.0).cpu().numpy()
-
-            # Remove the extra channel dimension if present
             mask = np.squeeze(mask)
-            
-            # Check if the mask is 2D (binary mask) and proceed
+
+            print(f"\nProcessing frame {out_frame_idx} (reverse)")
+            print(f"Mask shape: {mask.shape}")
+
             if len(mask.shape) == 2:
-                # Convert mask to binary (0 or 255)
                 binary_mask = (mask * 255).astype(np.uint8)
-                
-                # Show unique values and shape of the binary mask
-                print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
-                
-                # Add the binary mask to video_segments (no second key)
+                unique_vals = np.unique(binary_mask)
+                print(f"Binary mask unique values: {unique_vals}")
+                print(f"Binary mask shape: {binary_mask.shape}")
+
                 video_segments[out_frame_idx] = binary_mask
-                print(f"Processed frame {out_frame_idx}")
+                mask_count += 1
             else:
-                # Create a black mask (all zeros) with the same width and height as the original mask
+                print(f"WARNING: Non-2D mask detected for frame {out_frame_idx}")
                 black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
-                
-                # Add the black mask to video_segments (no second key)
                 video_segments[out_frame_idx] = black_mask
-                print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
 
-    # Sort the dictionary to ensure the frames are in proper order
-    video_segments = dict(sorted(video_segments.items()))
+    print(f"\nReverse propagation complete. Generated {mask_count} masks.")
+    print(f"Total frames in video_segments: {len(video_segments)}")
 
-    return video_segments
+    # Sort and return
+    return dict(sorted(video_segments.items()))
+
 
 def process_mask(mask):
     """
