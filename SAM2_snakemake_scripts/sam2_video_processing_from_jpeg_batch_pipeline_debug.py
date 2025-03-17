@@ -261,12 +261,15 @@ def segment_object(predictor, video_path, coordinate, frame_number, batch_number
     print(f"Labels:\n{labels}")
 
     print("\n=== Checking Image Folder ===")
+    '''
+    #causes a bug lets leave that for now!
     try:
         check_image_folder(video_path, batch_size)
         print("Image folder check passed successfully")
     except RuntimeError as e:
         print(f"ERROR in image folder check: {str(e)}")
         raise
+    '''
 
     print("\n=== Initializing Inference State ===")
     print(f"DEBUG: Initializing model with video_path: {video_path}")

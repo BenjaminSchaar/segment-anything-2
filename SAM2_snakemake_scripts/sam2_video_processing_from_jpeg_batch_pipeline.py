@@ -366,7 +366,7 @@ def main(args):
     parser.add_argument("-SAM2_path", type=str, help="Location of GitRepo!")
     parser.add_argument("--downsample_factor", type=float, default=0, help="Use in case DLC was used on downsampled video (default: 0)")
     parser.add_argument("--batch_size", type=int, default=100, help="Batch size for processing (default: 100)")
-
+    parser.add_argument("--device", type=str, help="Pass the cluster environment string according to lisc docu")
     # Parse the arguments
     args = parser.parse_args(args)
     
@@ -383,8 +383,13 @@ def main(args):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint}")
     if not os.path.exists(model_cfg):
         raise FileNotFoundError(f"Config file not found: {model_cfg}")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Get the device from arguments if provided, otherwise auto-detect
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     print(f"Using device: {device}")
     
     from sam2.build_sam import build_sam2_video_predictor
