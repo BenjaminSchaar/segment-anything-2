@@ -384,9 +384,8 @@ def main(args):
     if not os.path.exists(model_cfg):
         raise FileNotFoundError(f"Config file not found: {model_cfg}")
 
-    # Get the device from arguments if provided, otherwise auto-detect
     if args.device:
-        device = torch.device(args.device)
+        device = torch.device(f"cuda:{args.device}")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
