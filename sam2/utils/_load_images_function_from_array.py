@@ -65,5 +65,16 @@ def load_video_frames_from_array(
 
     # Normalize images by subtracting the mean and dividing by the standard deviation
     images = (images - img_mean) / img_std
+    
+    # Clear intermediate variables to free up memory
+    if 'img_mean' in locals() and img_mean is not None:
+        del img_mean
+    if 'img_std' in locals() and img_std is not None:
+        del img_std
+    
+    # Clear GPU cache after tensor normalization operation  
+    if images.is_cuda:
+        import torch
+        torch.cuda.empty_cache()
 
     return images, video_height, video_width

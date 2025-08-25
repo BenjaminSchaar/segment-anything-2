@@ -31,6 +31,7 @@ The final output is a TIFF file containing the binary masks for each video frame
 '''
 
 import torch
+import gc
 
 # Check if CUDA is available and display the GPU information
 if torch.cuda.is_available():
@@ -49,6 +50,20 @@ import argparse
 import tifffile as tiff
 import cv2
 import shutil
+
+def print_gpu_memory(prefix=""):
+    """
+    Print current GPU memory usage with GB precision.
+    
+    Args:
+    prefix (str): Descriptive prefix for the memory report
+    """
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert bytes to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)   # Convert bytes to GB
+        print(f"{prefix}GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
+    else:
+        print(f"{prefix}CUDA not available - no GPU memory to report")
 
 def read_DLC_csv(csv_file_path):
 
@@ -450,6 +465,11 @@ def segment_object_from_arrays(predictor, image_array, coordinate, frame_number,
     # Sort the dictionary to ensure the frames are in proper order
     video_segments = dict(sorted(video_segments.items()))
 
+    # Cleanup intermediate variables and clear GPU cache before return
+    del image_array_normalized
+    del images
+    torch.cuda.empty_cache()
+
     return video_segments
 
 def process_mask(mask):
@@ -657,22 +677,96 @@ def main(args):
         frames_dir = None  # No directory needed for array processing
         
         for (batch_number, _), batch_array in zip(batch_frame_count, batch_frame_arrays):
-            # Slice the DataFrame for the current batch
-            DLC_data_batch = DLC_data.iloc[batch_number * batch_size : (batch_number + 1) * batch_size]
+            # GPU memory monitoring - batch start
+            print_gpu_memory(f"[Batch {batch_number}] Start - ")
+            
+            try:
+                # Slice the DataFrame for the current batch
+                DLC_data_batch = DLC_data.iloc[batch_number * batch_size : (batch_number + 1) * batch_size]
 
-            # Extract coordinates and frame numbers for the current batch
-            coordinates, frame_number = extract_coordinate_by_likelihood(DLC_data_batch, column_names)
+                # Extract coordinates and frame numbers for the current batch
+                coordinates, frame_number = extract_coordinate_by_likelihood(DLC_data_batch, column_names)
 
-            # Generate mask for the current batch of frames using image arrays
-            print(f"Generating masklet for batch {batch_number}")
+                # Generate mask for the current batch of frames using image arrays
+                print(f"Generating masklet for batch {batch_number} with {len(batch_array)} frames")
 
-            masks = segment_object_from_arrays(predictor, batch_array, coordinates, frame_number, batch_number, batch_size)
-            print(f"Masklet generated for batch {batch_number}. Number of masks: {len(masks)}. Stored masks: {list(masks.keys())}")
+                masks = segment_object_from_arrays(predictor, batch_array, coordinates, frame_number, batch_number, batch_size)
+                print(f"Masklet generated for batch {batch_number}. Number of masks: {len(masks)}. Stored masks: {list(masks.keys())}")
 
-            # Concatenate masks into the final dictionary with global frame indexing
-            for out_frame_idx, binary_mask in masks.items():
-                global_frame_idx = out_frame_idx + (batch_number * batch_size)  # Adjust frame index to global frame count
-                final_mask_dict[global_frame_idx] = binary_mask  # Store or update the mask for the global frame
+                # Concatenate masks into the final dictionary with global frame indexing
+                for out_frame_idx, binary_mask in masks.items():
+                    global_frame_idx = out_frame_idx + (batch_number * batch_size)  # Adjust frame index to global frame count
+                    final_mask_dict[global_frame_idx] = binary_mask  # Store or update the mask for the global frame
+
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"[Batch {batch_number}] CUDA OOM Error encountered: {e}")
+                # Emergency memory cleanup
+                torch.cuda.empty_cache()
+                gc.collect()
+                print_gpu_memory(f"[Batch {batch_number}] After emergency cleanup - ")
+                
+                # Graduated recovery strategy
+                original_batch_size = len(batch_array)
+                if original_batch_size > 50:  # Try smaller batch size
+                    smaller_batch_size = max(25, original_batch_size // 2)
+                    print(f"[Batch {batch_number}] Attempting recovery with smaller batch size: {smaller_batch_size}")
+                    
+                    try:
+                        # Split the batch and process in smaller chunks
+                        masks = {}
+                        for chunk_start in range(0, original_batch_size, smaller_batch_size):
+                            chunk_end = min(chunk_start + smaller_batch_size, original_batch_size)
+                            chunk_array = batch_array[chunk_start:chunk_end]
+                            
+                            print(f"[Batch {batch_number}] Processing chunk {chunk_start}-{chunk_end}")
+                            chunk_masks = segment_object_from_arrays(predictor, chunk_array, coordinates, 
+                                                                   frame_number - chunk_start if frame_number >= chunk_start else 0, 
+                                                                   batch_number, smaller_batch_size)
+                            
+                            # Adjust frame indices for the chunk
+                            for chunk_frame_idx, chunk_mask in chunk_masks.items():
+                                adjusted_frame_idx = chunk_frame_idx + chunk_start
+                                masks[adjusted_frame_idx] = chunk_mask
+                            
+                            # Cleanup after each chunk
+                            del chunk_array
+                            del chunk_masks
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                        
+                        print(f"[Batch {batch_number}] Recovery successful with chunked processing")
+                        # Continue with the recovered masks - store in final_mask_dict
+                        for out_frame_idx, binary_mask in masks.items():
+                            global_frame_idx = out_frame_idx + (batch_number * batch_size)
+                            final_mask_dict[global_frame_idx] = binary_mask
+                        
+                    except torch.cuda.OutOfMemoryError as recovery_error:
+                        print(f"[Batch {batch_number}] Recovery attempt also failed: {recovery_error}")
+                        print(f"[Batch {batch_number}] Skipping batch due to persistent memory issues")
+                        # Continue with next batch rather than crashing
+                        continue
+                else:
+                    print(f"[Batch {batch_number}] Batch size already small ({original_batch_size}), cannot recover")
+                    print(f"[Batch {batch_number}] Skipping batch due to memory constraints")
+                    # Continue with next batch rather than crashing
+                    continue
+            
+            finally:
+                # Cleanup batch array and intermediate variables
+                del batch_array
+                if 'masks' in locals():
+                    del masks
+                if 'coordinates' in locals():
+                    del coordinates
+                if 'DLC_data_batch' in locals():
+                    del DLC_data_batch
+                
+                # Force GPU cache clearing after batch completion
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                # GPU memory monitoring - batch end
+                print_gpu_memory(f"[Batch {batch_number}] End - ")
     else:
         print("Using traditional JPEG extraction processing")
         # Traditional approach: extract frames to disk
