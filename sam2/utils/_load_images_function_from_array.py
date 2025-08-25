@@ -74,7 +74,6 @@ def load_video_frames_from_array(
     
     # Clear GPU cache after tensor normalization operation  
     if images.is_cuda:
-        import torch
         torch.cuda.empty_cache()
 
     return images, video_height, video_width
