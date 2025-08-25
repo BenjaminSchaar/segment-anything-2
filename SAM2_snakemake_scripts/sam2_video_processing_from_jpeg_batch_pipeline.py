@@ -324,6 +324,27 @@ def segment_object_from_arrays(predictor, image_array, coordinate, frame_number,
     
     print(f"Generating masklet for coordinate {coordinate} on frame {frame_number}")
     print(f"Image array shape: {image_array.shape}")
+    
+    # FRAME INDEX NORMALIZATION: Convert global frame number to batch-relative index
+    batch_relative_frame_number = frame_number - (batch_number * batch_size)
+    
+    # DEBUG LOGGING: Frame index transformation
+    print(f"Frame index transformation:")
+    print(f"  - Global frame number: {frame_number}")
+    print(f"  - Batch number: {batch_number}")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Calculated batch-relative frame: {batch_relative_frame_number}")
+    print(f"  - Image array size: {len(image_array)}")
+    
+    # INPUT VALIDATION: Ensure batch-relative frame number is valid
+    if not (0 <= batch_relative_frame_number < len(image_array)):
+        print(f"WARNING: Calculated batch-relative frame {batch_relative_frame_number} is out of bounds [0, {len(image_array)-1}]")
+        # Fallback to middle frame if index is invalid
+        fallback_frame = len(image_array) // 2
+        print(f"Using fallback frame: {fallback_frame}")
+        batch_relative_frame_number = fallback_frame
+    
+    print(f"Final batch-relative frame number for SAM2: {batch_relative_frame_number}")
 
     # Initialize lists to hold points and labels
     points_list = []
@@ -392,9 +413,10 @@ def segment_object_from_arrays(predictor, image_array, coordinate, frame_number,
     print("Initialized inference state with image arrays")
 
     # Add points to model and get mask logits
+    # Use batch-relative frame number for SAM2 (not global frame number)
     _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
         inference_state=inference_state,
-        frame_idx=frame_number,
+        frame_idx=batch_relative_frame_number,  # FIXED: Use batch-relative index
         obj_id=0,
         points=points,
         labels=labels,
@@ -556,11 +578,34 @@ def segment_object_with_lazy_video(predictor, video_path, coordinate, frame_numb
         inference_state["frames_already_tracked"] = {}
         
         print("Initialized inference state with lazy video provider")
+        
+        # FRAME INDEX NORMALIZATION: Convert global frame number to batch-relative index
+        # For lazy video provider, we need batch-relative indexing
+        batch_relative_frame_number = frame_number - (batch_number * batch_size)
+        
+        # DEBUG LOGGING: Frame index transformation for lazy loading
+        print(f"Lazy video frame index transformation:")
+        print(f"  - Global frame number: {frame_number}")
+        print(f"  - Batch number: {batch_number}")
+        print(f"  - Batch size: {batch_size}")
+        print(f"  - Calculated batch-relative frame: {batch_relative_frame_number}")
+        print(f"  - Lazy provider batch size: {len(lazy_provider)}")
+        
+        # INPUT VALIDATION: Ensure batch-relative frame number is valid for lazy provider
+        if not (0 <= batch_relative_frame_number < len(lazy_provider)):
+            print(f"WARNING: Calculated batch-relative frame {batch_relative_frame_number} is out of bounds [0, {len(lazy_provider)-1}]")
+            # Fallback to middle frame if index is invalid
+            fallback_frame = len(lazy_provider) // 2
+            print(f"Using fallback frame: {fallback_frame}")
+            batch_relative_frame_number = fallback_frame
+        
+        print(f"Final batch-relative frame number for lazy SAM2: {batch_relative_frame_number}")
 
         # Add points to model and get mask logits
+        # Use batch-relative frame number for SAM2 (not global frame number)
         _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
             inference_state=inference_state,
-            frame_idx=frame_number,
+            frame_idx=batch_relative_frame_number,  # FIXED: Use batch-relative index
             obj_id=0,
             points=points,
             labels=labels,
