@@ -290,6 +290,168 @@ def segment_object(predictor, video_path, coordinate, frame_number, batch_number
 
     return video_segments
 
+def segment_object_from_arrays(predictor, image_array, coordinate, frame_number, batch_number, batch_size):
+    """
+    Generate segmentation masks from image arrays using SAM2.
+    
+    Args:
+    predictor: SAM2 video predictor instance
+    image_array: numpy array of shape (num_frames, height, width, 3)
+    coordinate: dict of body part coordinates
+    frame_number: frame index within the batch
+    batch_number: current batch number
+    batch_size: batch size for processing
+    
+    Returns:
+    dict: Dictionary mapping frame indices to binary masks
+    """
+    
+    print(f"Generating masklet for coordinate {coordinate} on frame {frame_number}")
+    print(f"Image array shape: {image_array.shape}")
+
+    # Initialize lists to hold points and labels
+    points_list = []
+    labels_list = []
+    
+    # Iterate over each key (e.g., 'vulva', 'neck') in the coordinate dictionary
+    for key in coordinate:
+        # Iterate over each (x, y) tuple in the list associated with the key
+        for (x, y) in coordinate[key]:
+            points_list.append([x, y])
+            labels_list.append(1)  # You can customize the label as needed
+
+    # Convert the lists to NumPy arrays
+    points = np.array(points_list, dtype=np.float32)
+    labels = np.array(labels_list, dtype=np.int32)
+    
+    # Now you can use 'points' and 'labels' as needed
+    print("Points array:", points)
+    print("Labels array:", labels)
+
+    # Initialize inference state with image array instead of video path
+    from sam2.utils._load_images_function_from_array import load_video_frames_from_array
+    
+    # Prepare the image array for SAM2 (normalize from 0-255 to 0-1)
+    image_array_normalized = image_array.astype(np.float32) / 255.0
+    
+    # Load frames using the array-based loader
+    images, video_height, video_width = load_video_frames_from_array(
+        image_array=image_array_normalized,
+        image_size=predictor.image_size,
+        offload_video_to_cpu=False,
+        compute_device=predictor.device
+    )
+    
+    # Create inference state manually (similar to init_state but with arrays)
+    inference_state = {}
+    inference_state["images"] = images
+    inference_state["num_frames"] = len(images)
+    inference_state["offload_video_to_cpu"] = False
+    inference_state["offload_state_to_cpu"] = False
+    inference_state["video_height"] = video_height
+    inference_state["video_width"] = video_width
+    inference_state["device"] = predictor.device
+    inference_state["storage_device"] = predictor.device
+    inference_state["point_inputs_per_obj"] = {}
+    inference_state["mask_inputs_per_obj"] = {}
+    inference_state["cached_features"] = {}
+    inference_state["constants"] = {}
+    from collections import OrderedDict
+    inference_state["obj_id_to_idx"] = OrderedDict()
+    inference_state["obj_idx_to_id"] = OrderedDict()
+    inference_state["obj_ids"] = []
+    inference_state["output_dict"] = {
+        "cond_frame_outputs": {},
+        "non_cond_frame_outputs": {},
+    }
+    inference_state["output_dict_per_obj"] = {}
+    inference_state["temp_output_dict_per_obj"] = {}
+    inference_state["consolidated_frame_inds"] = {
+        "cond_frame_outputs": set(),
+        "non_cond_frame_outputs": set(),
+    }
+    inference_state["tracking_has_started"] = False
+    inference_state["frames_already_tracked"] = {}
+    
+    print("Initialized inference state with image arrays")
+
+    # Add points to model and get mask logits
+    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+        inference_state=inference_state,
+        frame_idx=frame_number,
+        obj_id=0,
+        points=points,
+        labels=labels,
+    )
+    
+    print("Added point to the model")
+
+    # Dictionary to store masks for video frames
+    video_segments = {}
+    print("Propagating masklet through video frames (forward direction):")
+
+    # Forward propagation (reverse=False)
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=False):
+        for i, out_obj_id in enumerate(out_obj_ids):
+            # Generate mask from logits
+            mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+
+            # Remove the extra channel dimension if present
+            mask = np.squeeze(mask)
+            
+            # Check if the mask is 2D (binary mask) and proceed
+            if len(mask.shape) == 2:
+                # Convert mask to binary (0 or 255)
+                binary_mask = (mask * 255).astype(np.uint8)
+                
+                # Show unique values and shape of the binary mask
+                print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
+                
+                # Add the binary mask to video_segments (no second key, just out_frame_idx)
+                video_segments[out_frame_idx] = binary_mask
+                print(f"Processed frame {out_frame_idx}")
+            else:
+                # Create a black mask (all zeros) with the same width and height as the original mask
+                black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
+                
+                # Add the black mask to video_segments (no second key)
+                video_segments[out_frame_idx] = black_mask
+                print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
+
+    # Reverse propagation (reverse=True)
+    print("Propagating masklet through video frames (reverse direction):")
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=True):
+        for i, out_obj_id in enumerate(out_obj_ids):
+            # Generate mask from logits
+            mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+
+            # Remove the extra channel dimension if present
+            mask = np.squeeze(mask)
+            
+            # Check if the mask is 2D (binary mask) and proceed
+            if len(mask.shape) == 2:
+                # Convert mask to binary (0 or 255)
+                binary_mask = (mask * 255).astype(np.uint8)
+                
+                # Show unique values and shape of the binary mask
+                print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
+                
+                # Add the binary mask to video_segments (no second key)
+                video_segments[out_frame_idx] = binary_mask
+                print(f"Processed frame {out_frame_idx}")
+            else:
+                # Create a black mask (all zeros) with the same width and height as the original mask
+                black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
+                
+                # Add the black mask to video_segments (no second key)
+                video_segments[out_frame_idx] = black_mask
+                print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
+
+    # Sort the dictionary to ensure the frames are in proper order
+    video_segments = dict(sorted(video_segments.items()))
+
+    return video_segments
+
 def process_mask(mask):
     """
     Process the input mask to ensure it's in the proper format:
@@ -325,6 +487,70 @@ def process_mask(mask):
 
     return mask_binary
 
+
+def load_video_frames_to_array(video_path, batch_size):
+    """
+    Load video frames directly into numpy arrays organized by batches.
+    
+    Args:
+    video_path (str): Path to the video file
+    batch_size (int): Number of frames per batch
+    
+    Returns:
+    tuple: (batch_frame_arrays, batch_frame_counts)
+        - batch_frame_arrays: List of numpy arrays, each containing frames for a batch
+        - batch_frame_counts: List of tuples (batch_number, frame_count)
+    """
+    video = cv2.VideoCapture(video_path)
+    
+    if not video.isOpened():
+        raise ValueError(f"Error opening video file: {video_path}")
+    
+    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    if total_frames == 0:
+        raise ValueError(f"No frames found in video file: {video_path}")
+    
+    batch_frame_arrays = []
+    batch_frame_counts = []
+    current_batch_frames = []
+    batch_number = 0
+    frame_count = 0
+    
+    try:
+        while True:
+            ret, frame = video.read()
+            if not ret:
+                break
+            
+            # Convert BGR to RGB for consistency with PIL/SAM2 expectations
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            current_batch_frames.append(frame_rgb)
+            frame_count += 1
+            
+            if len(current_batch_frames) == batch_size:
+                # Convert list of frames to numpy array (batch_size, height, width, 3)
+                batch_array = np.stack(current_batch_frames, axis=0)
+                batch_frame_arrays.append(batch_array)
+                batch_frame_counts.append((batch_number, len(current_batch_frames)))
+                
+                print(f"Loaded batch {batch_number} with {len(current_batch_frames)} frames")
+                current_batch_frames = []
+                batch_number += 1
+        
+        # Handle remaining frames in the last batch
+        if current_batch_frames:
+            batch_array = np.stack(current_batch_frames, axis=0)
+            batch_frame_arrays.append(batch_array)
+            batch_frame_counts.append((batch_number, len(current_batch_frames)))
+            print(f"Loaded final batch {batch_number} with {len(current_batch_frames)} frames")
+    
+    finally:
+        video.release()
+    
+    print(f"Loaded {frame_count} frames into {len(batch_frame_arrays)} batches")
+    
+    return batch_frame_arrays, batch_frame_counts
 
 def clear_temp_folder(frames_dir):
     """
@@ -367,6 +593,7 @@ def main(args):
     parser.add_argument("--downsample_factor", type=float, default=0, help="Use in case DLC was used on downsampled video (default: 0)")
     parser.add_argument("--batch_size", type=int, default=100, help="Batch size for processing (default: 100)")
     parser.add_argument("--device", type=str, help="Pass the cluster environment string according to lisc docu")
+    parser.add_argument("--use_image_arrays", action="store_true", default=False, help="Use direct image array processing instead of extracting frames to disk (default: False)")
     # Parse the arguments
     args = parser.parse_args(args)
     
@@ -403,16 +630,16 @@ def main(args):
     column_names = args.column_names
     downsample_factor = args.downsample_factor
     batch_size = args.batch_size
+    use_image_arrays = args.use_image_arrays
 
     print(f"Video File: {video_path}")
     print(f"Output file: {output_file_path}")
     print(f"DLC CSV file: {DLC_csv_file_path}")
     print(f"Column names: {column_names}")
     print(f"Batchsize: {batch_size}")
+    print(f"Use image arrays: {use_image_arrays}")
 
-    print("Extracting frames from video")
-    frames_dir, batch_frame_count = create_frames_directory(video_path, batch_size)
-
+    # Read DLC data
     DLC_data = read_DLC_csv(DLC_csv_file_path)
 
     if downsample_factor != 0:
@@ -422,26 +649,55 @@ def main(args):
     # Initialize a variable to hold the final concatenated mask
     final_mask_dict = {}
 
-    for batch_number, _ in batch_frame_count:
-        # Directory for the current batch of frames
-        batch_dir = os.path.join(frames_dir, f"{batch_number}")
+    # Choose processing method based on flag
+    if use_image_arrays:
+        print("Using direct image array processing")
+        # Load video frames directly into arrays
+        batch_frame_arrays, batch_frame_count = load_video_frames_to_array(video_path, batch_size)
+        frames_dir = None  # No directory needed for array processing
+        
+        for (batch_number, _), batch_array in zip(batch_frame_count, batch_frame_arrays):
+            # Slice the DataFrame for the current batch
+            DLC_data_batch = DLC_data.iloc[batch_number * batch_size : (batch_number + 1) * batch_size]
 
-        # Slice the DataFrame for the current batch
-        DLC_data_batch = DLC_data.iloc[batch_number * batch_size : (batch_number + 1) * batch_size]
+            # Extract coordinates and frame numbers for the current batch
+            coordinates, frame_number = extract_coordinate_by_likelihood(DLC_data_batch, column_names)
 
-        # Extract coordinates and frame numbers for the current batch
-        coordinates, frame_number = extract_coordinate_by_likelihood(DLC_data_batch, column_names)
+            # Generate mask for the current batch of frames using image arrays
+            print(f"Generating masklet for batch {batch_number}")
 
-        # Generate mask for the current batch of frames
-        print(f"Generating masklet for batch {batch_number}")
+            masks = segment_object_from_arrays(predictor, batch_array, coordinates, frame_number, batch_number, batch_size)
+            print(f"Masklet generated for batch {batch_number}. Number of masks: {len(masks)}. Stored masks: {list(masks.keys())}")
 
-        masks = segment_object(predictor, batch_dir, coordinates, frame_number, batch_number, batch_size)
-        print(f"Masklet generated for batch {batch_number}. Number of masks: {len(masks)}. Stored masks: {list(masks.keys())}")
+            # Concatenate masks into the final dictionary with global frame indexing
+            for out_frame_idx, binary_mask in masks.items():
+                global_frame_idx = out_frame_idx + (batch_number * batch_size)  # Adjust frame index to global frame count
+                final_mask_dict[global_frame_idx] = binary_mask  # Store or update the mask for the global frame
+    else:
+        print("Using traditional JPEG extraction processing")
+        # Traditional approach: extract frames to disk
+        frames_dir, batch_frame_count = create_frames_directory(video_path, batch_size)
+        
+        for batch_number, _ in batch_frame_count:
+            # Directory for the current batch of frames
+            batch_dir = os.path.join(frames_dir, f"{batch_number}")
 
-         # Concatenate masks into the final dictionary with global frame indexing
-        for out_frame_idx, binary_mask in masks.items():
-            global_frame_idx = out_frame_idx + (batch_number * batch_size)  # Adjust frame index to global frame count
-            final_mask_dict[global_frame_idx] = binary_mask  # Store or update the mask for the global frame
+            # Slice the DataFrame for the current batch
+            DLC_data_batch = DLC_data.iloc[batch_number * batch_size : (batch_number + 1) * batch_size]
+
+            # Extract coordinates and frame numbers for the current batch
+            coordinates, frame_number = extract_coordinate_by_likelihood(DLC_data_batch, column_names)
+
+            # Generate mask for the current batch of frames
+            print(f"Generating masklet for batch {batch_number}")
+
+            masks = segment_object(predictor, batch_dir, coordinates, frame_number, batch_number, batch_size)
+            print(f"Masklet generated for batch {batch_number}. Number of masks: {len(masks)}. Stored masks: {list(masks.keys())}")
+
+            # Concatenate masks into the final dictionary with global frame indexing
+            for out_frame_idx, binary_mask in masks.items():
+                global_frame_idx = out_frame_idx + (batch_number * batch_size)  # Adjust frame index to global frame count
+                final_mask_dict[global_frame_idx] = binary_mask  # Store or update the mask for the global frame
 
     """
     Process and save the final mask dictionary into a TIFF file.
@@ -462,8 +718,9 @@ def main(args):
     
     print(f"All masks saved to {output_file_path}.")
 
-    # After everything is finished, delete the temporary folder
-    clear_temp_folder(frames_dir)
+    # After everything is finished, delete the temporary folder (only for traditional method)
+    if not use_image_arrays and frames_dir is not None:
+        clear_temp_folder(frames_dir)
 
 if __name__ == "__main__":
      main(sys.argv[1:])  # exclude the script name from the args when called from sh
