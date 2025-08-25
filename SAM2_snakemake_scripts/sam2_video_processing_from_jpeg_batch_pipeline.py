@@ -50,6 +50,7 @@ import argparse
 import tifffile as tiff
 import cv2
 import shutil
+from sam2.utils.lazy_video_provider import create_lazy_video_provider
 
 def print_gpu_memory(prefix=""):
     """
@@ -472,6 +473,176 @@ def segment_object_from_arrays(predictor, image_array, coordinate, frame_number,
 
     return video_segments
 
+def segment_object_with_lazy_video(predictor, video_path, coordinate, frame_number, batch_number, batch_size):
+    """
+    Generate segmentation masks using lazy video loading for memory efficiency.
+    
+    Args:
+    predictor: SAM2 video predictor instance
+    video_path: Path to the video file
+    coordinate: dict of body part coordinates
+    frame_number: frame index within the batch
+    batch_number: current batch number
+    batch_size: batch size for processing
+    
+    Returns:
+    dict: Dictionary mapping frame indices to binary masks
+    """
+    
+    print(f"Generating masklet for coordinate {coordinate} on frame {frame_number} using lazy loading")
+    print(f"Processing video: {video_path}")
+
+    # Initialize lists to hold points and labels
+    points_list = []
+    labels_list = []
+    
+    # Iterate over each key (e.g., 'vulva', 'neck') in the coordinate dictionary
+    for key in coordinate:
+        # Iterate over each (x, y) tuple in the list associated with the key
+        for (x, y) in coordinate[key]:
+            points_list.append([x, y])
+            labels_list.append(1)  # You can customize the label as needed
+
+    # Convert the lists to NumPy arrays
+    points = np.array(points_list, dtype=np.float32)
+    labels = np.array(labels_list, dtype=np.int32)
+    
+    # Now you can use 'points' and 'labels' as needed
+    print("Points array:", points)
+    print("Labels array:", labels)
+
+    # Create lazy video provider instead of loading all frames
+    batch_start_frame = batch_number * batch_size
+    lazy_provider = create_lazy_video_provider(
+        video_path=video_path,
+        batch_start_frame=batch_start_frame,
+        batch_size=batch_size,
+        image_size=predictor.image_size,
+        device=predictor.device,
+        cache_size=50,  # Keep up to 50 frames in memory
+        prefetch_size=5  # Prefetch 5 frames ahead
+    )
+    
+    try:
+        # Create inference state with lazy provider
+        inference_state = {}
+        inference_state["images"] = lazy_provider  # SAM2 will call lazy_provider[frame_idx] 
+        inference_state["num_frames"] = len(lazy_provider)
+        inference_state["offload_video_to_cpu"] = False
+        inference_state["offload_state_to_cpu"] = False
+        inference_state["video_height"] = lazy_provider.video_height or 896  # Default if not loaded yet
+        inference_state["video_width"] = lazy_provider.video_width or 900    # Default if not loaded yet
+        inference_state["device"] = predictor.device
+        inference_state["storage_device"] = predictor.device
+        inference_state["point_inputs_per_obj"] = {}
+        inference_state["mask_inputs_per_obj"] = {}
+        inference_state["cached_features"] = {}
+        inference_state["constants"] = {}
+        from collections import OrderedDict
+        inference_state["obj_id_to_idx"] = OrderedDict()
+        inference_state["obj_idx_to_id"] = OrderedDict()
+        inference_state["obj_ids"] = []
+        inference_state["output_dict"] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+        inference_state["output_dict_per_obj"] = {}
+        inference_state["temp_output_dict_per_obj"] = {}
+        inference_state["consolidated_frame_inds"] = {
+            "cond_frame_outputs": set(),
+            "non_cond_frame_outputs": set(),
+        }
+        inference_state["tracking_has_started"] = False
+        inference_state["frames_already_tracked"] = {}
+        
+        print("Initialized inference state with lazy video provider")
+
+        # Add points to model and get mask logits
+        _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=frame_number,
+            obj_id=0,
+            points=points,
+            labels=labels,
+        )
+        
+        print("Added point to the model")
+
+        # Dictionary to store masks for video frames
+        video_segments = {}
+        print("Propagating masklet through video frames (forward direction):")
+
+        # Forward propagation (reverse=False)
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=False):
+            for i, out_obj_id in enumerate(out_obj_ids):
+                # Generate mask from logits
+                mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+
+                # Remove the extra channel dimension if present
+                mask = np.squeeze(mask)
+                
+                # Check if the mask is 2D (binary mask) and proceed
+                if len(mask.shape) == 2:
+                    # Convert mask to binary (0 or 255)
+                    binary_mask = (mask * 255).astype(np.uint8)
+                    
+                    # Show unique values and shape of the binary mask
+                    print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
+                    
+                    # Add the binary mask to video_segments (no second key, just out_frame_idx)
+                    video_segments[out_frame_idx] = binary_mask
+                    print(f"Processed frame {out_frame_idx}")
+                else:
+                    # Create a black mask (all zeros) with the same width and height as the original mask
+                    black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
+                    
+                    # Add the black mask to video_segments (no second key)
+                    video_segments[out_frame_idx] = black_mask
+                    print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
+
+        # Reverse propagation (reverse=True)
+        print("Propagating masklet through video frames (reverse direction):")
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=True):
+            for i, out_obj_id in enumerate(out_obj_ids):
+                # Generate mask from logits
+                mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+
+                # Remove the extra channel dimension if present
+                mask = np.squeeze(mask)
+                
+                # Check if the mask is 2D (binary mask) and proceed
+                if len(mask.shape) == 2:
+                    # Convert mask to binary (0 or 255)
+                    binary_mask = (mask * 255).astype(np.uint8)
+                    
+                    # Show unique values and shape of the binary mask
+                    print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
+                    
+                    # Add the binary mask to video_segments (no second key)
+                    video_segments[out_frame_idx] = binary_mask
+                    print(f"Processed frame {out_frame_idx}")
+                else:
+                    # Create a black mask (all zeros) with the same width and height as the original mask
+                    black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
+                    
+                    # Add the black mask to video_segments (no second key)
+                    video_segments[out_frame_idx] = black_mask
+                    print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
+
+        # Sort the dictionary to ensure the frames are in proper order
+        video_segments = dict(sorted(video_segments.items()))
+
+        # Print cache statistics for monitoring
+        stats = lazy_provider.get_stats()
+        print(f"Lazy provider stats: {stats}")
+
+        return video_segments
+    
+    finally:
+        # Cleanup lazy provider cache
+        lazy_provider.clear_cache()
+        torch.cuda.empty_cache()
+
 def process_mask(mask):
     """
     Process the input mask to ensure it's in the proper format:
@@ -614,6 +785,7 @@ def main(args):
     parser.add_argument("--batch_size", type=int, default=100, help="Batch size for processing (default: 100)")
     parser.add_argument("--device", type=str, help="Pass the cluster environment string according to lisc docu")
     parser.add_argument("--use_image_arrays", action="store_true", default=False, help="Use direct image array processing instead of extracting frames to disk (default: False)")
+    parser.add_argument("--use_lazy_video", action="store_true", default=False, help="Use lazy video loading for memory-efficient 400-frame processing (default: False)")
     # Parse the arguments
     args = parser.parse_args(args)
     
@@ -651,6 +823,7 @@ def main(args):
     downsample_factor = args.downsample_factor
     batch_size = args.batch_size
     use_image_arrays = args.use_image_arrays
+    use_lazy_video = args.use_lazy_video
 
     print(f"Video File: {video_path}")
     print(f"Output file: {output_file_path}")
@@ -658,6 +831,7 @@ def main(args):
     print(f"Column names: {column_names}")
     print(f"Batchsize: {batch_size}")
     print(f"Use image arrays: {use_image_arrays}")
+    print(f"Use lazy video loading: {use_lazy_video}")
 
     # Read DLC data
     DLC_data = read_DLC_csv(DLC_csv_file_path)
@@ -670,7 +844,69 @@ def main(args):
     final_mask_dict = {}
 
     # Choose processing method based on flag
-    if use_image_arrays:
+    if use_lazy_video:
+        print("Using lazy video loading for memory-efficient processing")
+        # Calculate batch information for lazy loading
+        video_cap = cv2.VideoCapture(video_path)
+        total_frames = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_cap.release()
+        
+        batch_frame_count = []
+        for batch_num in range(0, total_frames, batch_size):
+            frames_in_batch = min(batch_size, total_frames - batch_num)
+            batch_frame_count.append((batch_num // batch_size, frames_in_batch))
+        
+        frames_dir = None  # No directory needed for lazy loading
+        
+        for batch_number, frames_in_batch in batch_frame_count:
+            # GPU memory monitoring - batch start
+            print_gpu_memory(f"[Lazy Batch {batch_number}] Start - ")
+            
+            try:
+                # Slice the DataFrame for the current batch
+                DLC_data_batch = DLC_data.iloc[batch_number * batch_size : (batch_number + 1) * batch_size]
+
+                # Extract coordinates and frame numbers for the current batch  
+                coordinates, frame_number = extract_coordinate_by_likelihood(DLC_data_batch, column_names)
+
+                # Generate mask for the current batch using lazy video loading
+                print(f"Generating masklet for lazy batch {batch_number} with {frames_in_batch} frames")
+
+                masks = segment_object_with_lazy_video(predictor, video_path, coordinates, frame_number, batch_number, batch_size)
+                print(f"Masklet generated for lazy batch {batch_number}. Number of masks: {len(masks)}. Stored masks: {list(masks.keys())}")
+
+                # Concatenate masks into the final dictionary with global frame indexing
+                for out_frame_idx, binary_mask in masks.items():
+                    global_frame_idx = out_frame_idx + (batch_number * batch_size)  # Adjust frame index to global frame count
+                    final_mask_dict[global_frame_idx] = binary_mask  # Store or update the mask for the global frame
+
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"[Lazy Batch {batch_number}] CUDA OOM Error encountered: {e}")
+                # Emergency memory cleanup
+                torch.cuda.empty_cache()
+                gc.collect()
+                print_gpu_memory(f"[Lazy Batch {batch_number}] After emergency cleanup - ")
+                # For lazy loading, this shouldn't happen often, but skip if it does
+                print(f"[Lazy Batch {batch_number}] Skipping batch due to persistent memory issues")
+                continue
+            
+            finally:
+                # Cleanup intermediate variables
+                if 'masks' in locals():
+                    del masks
+                if 'coordinates' in locals():
+                    del coordinates
+                if 'DLC_data_batch' in locals():
+                    del DLC_data_batch
+                
+                # Force GPU cache clearing after batch completion
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                # GPU memory monitoring - batch end
+                print_gpu_memory(f"[Lazy Batch {batch_number}] End - ")
+                
+    elif use_image_arrays:
         print("Using direct image array processing")
         # Load video frames directly into arrays
         batch_frame_arrays, batch_frame_count = load_video_frames_to_array(video_path, batch_size)
