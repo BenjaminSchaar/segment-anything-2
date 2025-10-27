@@ -47,16 +47,16 @@ class LazyVideoProvider:
     """
 
     def __init__(
-            self,
-            tiff_path: str,
-            batch_start_frame: int,
-            batch_end_frame: int,
-            image_size: int,
-            device: torch.device,
-            cache_size: int = 50,
-            prefetch_size: int = 5,
-            img_mean: tuple = (0.485, 0.456, 0.406),
-            img_std: tuple = (0.229, 0.224, 0.225)
+        self,
+        tiff_path: str,
+        batch_start_frame: int,
+        batch_end_frame: int,
+        image_size: int,
+        device: torch.device,
+        cache_size: int = 50,
+        prefetch_size: int = 5,
+        img_mean: tuple = (0.485, 0.456, 0.406),
+        img_std: tuple = (0.229, 0.224, 0.225)
     ):
         """
         Initialize the lazy TIFF/BTF provider.
@@ -312,12 +312,12 @@ class LazyVideoProvider:
 
 
 def create_lazy_video_provider(
-        tiff_path: str,
-        batch_start_frame: int,
-        batch_size: int,
-        image_size: int,
-        device: torch.device,
-        **kwargs
+    tiff_path: str,
+    batch_start_frame: int,
+    batch_size: int,
+    image_size: int,
+    device: torch.device,
+    **kwargs
 ) -> LazyVideoProvider:
     """
     Convenience function to create a LazyVideoProvider for TIFF/BTF files.
@@ -357,8 +357,8 @@ def print_gpu_memory(prefix=""):
         prefix (str): Descriptive prefix for the memory report
     """
     if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / (1024 ** 3)  # Convert bytes to GB
-        reserved = torch.cuda.memory_reserved() / (1024 ** 3)  # Convert bytes to GB
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert bytes to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)   # Convert bytes to GB
         print(f"{prefix}GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
     else:
         print(f"{prefix}CUDA not available - no GPU memory to report")
@@ -506,21 +506,27 @@ def main(args=None):
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='SAM2 TIFF/BTF Lazy Video Processing Pipeline')
     parser.add_argument('-tiff_path', type=str, required=True,
-                        help='Path to the input TIFF/BTF file or folder')
+                       help='Path to the input TIFF/BTF file or folder')
     parser.add_argument('-output_file_path', type=str, required=True,
-                        help='Path to the output TIFF file')
+                       help='Path to the output TIFF file')
     parser.add_argument('-DLC_csv_file_path', type=str, required=True,
-                        help='Path to the DeepLabCut CSV file')
+                       help='Path to the DeepLabCut CSV file')
     parser.add_argument('-column_names', type=str, required=True,
-                        help='Comma-separated list of body part column names')
+                       help='Comma-separated list of body part column names')
     parser.add_argument('-SAM2_path', type=str, required=True,
-                        help='Path to the SAM2 model directory')
+                       help='Path to the SAM2 model directory')
     parser.add_argument('--batch_size', type=int, default=400,
-                        help='Number of frames per batch')
+                       help='Number of frames per batch')
     parser.add_argument('--device', type=str, default='0',
-                        help='CUDA device ID')
+                       help='CUDA device ID')
 
     args = parser.parse_args(args)
+
+    # DEBUG: Show input path
+    print(f"\n{'='*60}")
+    print(f"DEBUG: Input TIFF/BTF path: {args.tiff_path}")
+    print(f"DEBUG: Using MicroscopeDataReader for lazy loading")
+    print(f"{'='*60}\n")
 
     # Parse column names
     column_names = [name.strip() for name in args.column_names.split(',')]
@@ -536,7 +542,8 @@ def main(args=None):
     from sam2.build_sam import build_sam2_video_predictor
 
     sam2_checkpoint = os.path.join(args.SAM2_path, "checkpoints", "sam2.1_hiera_large.pt")
-    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    # Use absolute path like the old script (leading "/" makes Hydra accept absolute paths)
+    model_cfg = "/" + os.path.join(args.SAM2_path, "configs/sam2.1/sam2.1_hiera_l.yaml")
 
     predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
     print("SAM2 model loaded successfully")
@@ -564,10 +571,10 @@ def main(args=None):
         batch_end = min(batch_start + args.batch_size, total_frames)
         current_batch_size = batch_end - batch_start
 
-        print(f"\n{'=' * 60}")
+        print(f"\n{'='*60}")
         print(f"Processing Batch {batch_number + 1}/{num_batches}")
         print(f"Frames: {batch_start} to {batch_end - 1} (size: {current_batch_size})")
-        print(f"{'=' * 60}")
+        print(f"{'='*60}")
 
         # GPU memory monitoring - batch start
         print_gpu_memory(f"[Lazy Batch {batch_number}] Start - ")
@@ -592,7 +599,7 @@ def main(args=None):
             # Generate masks for the current batch
             print(f"Generating masks for batch {batch_number}...")
             masks = segment_object_lazy(predictor, video_provider, coordinates,
-                                        frame_number, batch_number, current_batch_size)
+                                       frame_number, batch_number, current_batch_size)
             print(f"Masks generated for batch {batch_number}. Number of masks: {len(masks)}")
 
             # Concatenate masks into the final dictionary with global frame indexing
@@ -635,9 +642,9 @@ def main(args=None):
             print_gpu_memory(f"[Lazy Batch {batch_number}] End - ")
 
     # Save all masks to TIFF file
-    print(f"\n{'=' * 60}")
+    print(f"\n{'='*60}")
     print("Saving masks to TIFF file...")
-    print(f"{'=' * 60}")
+    print(f"{'='*60}")
 
     sorted_mask_keys = sorted(final_mask_dict.keys())
     print(f"Total number of masks: {len(sorted_mask_keys)}")
@@ -655,6 +662,7 @@ def main(args=None):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
+
 
 # ============================================================================
 # SNAKEMAKE RULE EXAMPLE
@@ -686,7 +694,7 @@ rule sam2_segment:
         fi
 
         module load cuda-toolkit/12.6.3
-
+        
         # Activate the environment and the correct cuda
         source /lisc/app/conda/miniforge3/bin/activate {params.sam2_conda_env_name}
 
