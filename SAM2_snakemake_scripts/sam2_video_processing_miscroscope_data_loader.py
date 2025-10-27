@@ -541,9 +541,9 @@ def main(args=None):
     sys.path.append(args.SAM2_path)
     from sam2.build_sam import build_sam2_video_predictor
 
-    sam2_checkpoint = os.path.join(args.SAM2_path, "checkpoints", "sam2.1_hiera_large.pt")
-    # Use absolute path like the old script (leading "/" makes Hydra accept absolute paths)
-    model_cfg = "/" + os.path.join(args.SAM2_path, "configs/sam2.1/sam2.1_hiera_l.yaml")
+    # Use exact same paths as the old working script
+    sam2_checkpoint = os.path.join(args.SAM2_path, "checkpoints", "sam2_hiera_large.pt")
+    model_cfg = "/" + os.path.join(args.SAM2_path, "sam2_configs", "sam2_hiera_l.yaml")
 
     predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
     print("SAM2 model loaded successfully")
