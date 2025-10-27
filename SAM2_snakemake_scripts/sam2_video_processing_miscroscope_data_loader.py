@@ -96,6 +96,10 @@ class LazyVideoProvider:
         # Image properties (loaded on first access)
         self.image_height: Optional[int] = None
         self.image_width: Optional[int] = None
+        
+        # SAM2 compatibility - these properties are expected by SAM2
+        self.video_height: Optional[int] = None
+        self.video_width: Optional[int] = None
 
         # Statistics for monitoring
         self.cache_hits = 0
@@ -131,6 +135,10 @@ class LazyVideoProvider:
                 self.image_height, self.image_width = self._dask_array.shape
             else:
                 raise ValueError(f"Unexpected dask array shape: {self._dask_array.shape}")
+            
+            # Set SAM2 compatibility properties
+            self.video_height = self.image_height
+            self.video_width = self.image_width
 
             print(f"Loaded TIFF/BTF with shape: {self._dask_array.shape}, dtype: {self._dask_array.dtype}")
 
@@ -463,7 +471,49 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
     Returns:
         Dictionary mapping frame indices to binary masks
     """
-    inference_state = predictor.init_state(video_provider)
+    # Create inference state manually since init_state doesn't support custom video providers
+    from collections import OrderedDict
+    
+    compute_device = predictor.device  # device of the model
+    
+    # Ensure video provider has the required properties initialized
+    if video_provider.video_height is None:
+        video_provider._initialize_microscope_reader()
+    
+    # Create inference state structure compatible with SAM2
+    inference_state = {}
+    inference_state["images"] = video_provider
+    inference_state["num_frames"] = len(video_provider)
+    inference_state["offload_video_to_cpu"] = False  # Keep frames on GPU for better performance
+    inference_state["offload_state_to_cpu"] = False  # Keep state on GPU for better performance  
+    inference_state["video_height"] = video_provider.video_height
+    inference_state["video_width"] = video_provider.video_width
+    inference_state["device"] = compute_device
+    inference_state["storage_device"] = compute_device
+    
+    # Initialize tracking data structures
+    inference_state["point_inputs_per_obj"] = {}
+    inference_state["mask_inputs_per_obj"] = {}
+    inference_state["cached_features"] = {}
+    inference_state["constants"] = {}
+    inference_state["obj_id_to_idx"] = OrderedDict()
+    inference_state["obj_idx_to_id"] = OrderedDict()
+    inference_state["obj_ids"] = []
+    inference_state["output_dict"] = {
+        "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+        "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+    }
+    inference_state["output_dict_per_obj"] = {}
+    inference_state["temp_output_dict_per_obj"] = {}
+    inference_state["consolidated_frame_inds"] = {
+        "cond_frame_outputs": set(),  # set containing frame indices
+        "non_cond_frame_outputs": set(),  # set containing frame indices
+    }
+    inference_state["tracking_has_started"] = False
+    inference_state["frames_already_tracked"] = {}
+    
+    # Warm up the visual backbone and cache the image feature on frame 0
+    predictor._get_image_feature(inference_state, frame_idx=0, batch_size=1)
 
     # Add points for each body part
     for bodypart, coords in coordinates.items():
