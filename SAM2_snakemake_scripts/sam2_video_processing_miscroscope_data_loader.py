@@ -740,7 +740,7 @@ def main(args=None):
     sys.path.append(args.SAM2_path)
     from sam2.build_sam import build_sam2_video_predictor
     sam2_checkpoint = os.path.join(args.SAM2_path, "checkpoints", "sam2_hiera_large.pt")
-    model_cfg = os.path.join(args.SAM2_path, "sam2_configs", "sam2_hiera_l.yaml")
+    model_cfg = "sam2_hiera_l.yaml"  # Just filename - Hydra knows to look in sam2_configs
     predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
     print("SAM2 model loaded successfully")
 
