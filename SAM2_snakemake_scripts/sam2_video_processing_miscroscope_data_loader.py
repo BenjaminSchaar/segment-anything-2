@@ -21,7 +21,7 @@ import argparse
 import tifffile as tiff
 from typing import Dict, Optional, Union
 from collections import OrderedDict
-from threading import Lock
+from threading import Lock, RLock
 from imutils import MicroscopeDataReader
 import dask.array as da
 
@@ -87,7 +87,7 @@ class LazyVideoProvider:
 
         # LRU cache for frames (OrderedDict maintains access order)
         self.frame_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
-        self.cache_lock = Lock()
+        self.cache_lock = RLock()  # Use RLock (reentrant) to avoid deadlock in prefetch
 
         # MicroscopeDataReader object (initialized lazily)
         self._reader: Optional[MicroscopeDataReader] = None
@@ -96,7 +96,7 @@ class LazyVideoProvider:
         # Image properties (loaded on first access)
         self.image_height: Optional[int] = None
         self.image_width: Optional[int] = None
-        
+
         # SAM2 compatibility - these properties are expected by SAM2
         self.video_height: Optional[int] = None
         self.video_width: Optional[int] = None
@@ -135,7 +135,7 @@ class LazyVideoProvider:
                 self.image_height, self.image_width = self._dask_array.shape
             else:
                 raise ValueError(f"Unexpected dask array shape: {self._dask_array.shape}")
-            
+
             # Set SAM2 compatibility properties
             self.video_height = self.image_height
             self.video_width = self.image_width
