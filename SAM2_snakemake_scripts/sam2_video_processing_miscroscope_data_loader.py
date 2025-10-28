@@ -471,34 +471,37 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
     Returns:
         Dictionary mapping frame indices to binary masks
     """
-    # Use SAM2's proper initialization method similar to the working script
-    # Create a temporary directory structure that SAM2's init_state expects
+    # Use SAM2's proper initialization method by patching the load_video_frames function
     import tempfile
     import os
     from collections import OrderedDict
+    from sam2.utils import misc
     
     # Ensure video provider has the required properties initialized
     if video_provider.video_height is None:
         video_provider._initialize_microscope_reader()
     
-    # Use SAM2's built-in initialization to properly set up inference state
-    # We'll patch the _load_images method temporarily to use our lazy provider
-    original_load_images = predictor._load_images
+    # Store the original load_video_frames function
+    original_load_video_frames = misc.load_video_frames
     
-    def patched_load_images(video_path, image_size, offload_video_to_cpu, compute_device):
-        """Patched version that returns our lazy video provider instead of loading images."""
+    def patched_load_video_frames(video_path, image_size, offload_video_to_cpu, 
+                                 img_mean=(0.485, 0.456, 0.406),
+                                 img_std=(0.229, 0.224, 0.225),
+                                 async_loading_frames=False,
+                                 compute_device=torch.device("cuda")):
+        """Patched version that returns our lazy video provider instead of loading JPEG files."""
         return video_provider, video_provider.video_height, video_provider.video_width
     
-    # Temporarily replace the method
-    predictor._load_images = patched_load_images
+    # Temporarily replace the load_video_frames function
+    misc.load_video_frames = patched_load_video_frames
     
     try:
         # Use SAM2's proper init_state with a dummy path (won't be used due to patch)
         inference_state = predictor.init_state(video_path="dummy_path")
         print("Initialized inference state with lazy video provider using SAM2's init_state")
     finally:
-        # Restore the original method
-        predictor._load_images = original_load_images
+        # Restore the original function to not break other functionality
+        misc.load_video_frames = original_load_video_frames
 
     # Convert global frame number to batch-relative index (like working script)
     batch_relative_frame_number = frame_number - (batch_number * batch_size)
