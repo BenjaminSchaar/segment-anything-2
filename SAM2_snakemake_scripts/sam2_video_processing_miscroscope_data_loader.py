@@ -471,91 +471,134 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
     Returns:
         Dictionary mapping frame indices to binary masks
     """
-    # Create inference state manually since init_state doesn't support custom video providers
+    # Use SAM2's proper initialization method similar to the working script
+    # Create a temporary directory structure that SAM2's init_state expects
+    import tempfile
+    import os
     from collections import OrderedDict
-    
-    compute_device = predictor.device  # device of the model
     
     # Ensure video provider has the required properties initialized
     if video_provider.video_height is None:
         video_provider._initialize_microscope_reader()
     
-    # Create inference state structure compatible with SAM2
-    inference_state = {}
-    inference_state["images"] = video_provider
-    inference_state["num_frames"] = len(video_provider)
-    inference_state["offload_video_to_cpu"] = False  # Keep frames on GPU for better performance
-    inference_state["offload_state_to_cpu"] = False  # Keep state on GPU for better performance  
-    inference_state["video_height"] = video_provider.video_height
-    inference_state["video_width"] = video_provider.video_width
-    inference_state["device"] = compute_device
-    inference_state["storage_device"] = compute_device
+    # Use SAM2's built-in initialization to properly set up inference state
+    # We'll patch the _load_images method temporarily to use our lazy provider
+    original_load_images = predictor._load_images
     
-    # Initialize tracking data structures
-    inference_state["point_inputs_per_obj"] = {}
-    inference_state["mask_inputs_per_obj"] = {}
-    inference_state["cached_features"] = {}
-    inference_state["constants"] = {}
-    inference_state["obj_id_to_idx"] = OrderedDict()
-    inference_state["obj_idx_to_id"] = OrderedDict()
-    inference_state["obj_ids"] = []
-    inference_state["output_dict"] = {
-        "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
-        "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
-    }
-    inference_state["output_dict_per_obj"] = {}
-    inference_state["temp_output_dict_per_obj"] = {}
-    inference_state["consolidated_frame_inds"] = {
-        "cond_frame_outputs": set(),  # set containing frame indices
-        "non_cond_frame_outputs": set(),  # set containing frame indices
-    }
-    inference_state["tracking_has_started"] = False
-    inference_state["frames_already_tracked"] = {}
+    def patched_load_images(video_path, image_size, offload_video_to_cpu, compute_device):
+        """Patched version that returns our lazy video provider instead of loading images."""
+        return video_provider, video_provider.video_height, video_provider.video_width
     
-    # CRITICAL FIX: Do NOT call _get_image_feature here!
-    # The old working script doesn't call this, and it causes a hang.
-    # SAM2 will call it internally when needed.
+    # Temporarily replace the method
+    predictor._load_images = patched_load_images
+    
+    try:
+        # Use SAM2's proper init_state with a dummy path (won't be used due to patch)
+        inference_state = predictor.init_state(video_path="dummy_path")
+        print("Initialized inference state with lazy video provider using SAM2's init_state")
+    finally:
+        # Restore the original method
+        predictor._load_images = original_load_images
 
-    print("Initialized inference state with lazy video provider")
-
-    # NOTE: Coordinate scaling is NOT needed!
-    # SAM2 handles it automatically based on:
-    # - inference_state["video_height/width"] = original dimensions (e.g., 150×150)
-    # - Frame tensor shape = resized dimensions (1024×1024)
-    # SAM2 scales coordinates internally, so we pass them as-is from DLC
-
-    # Add points for each body part (coordinates as-is from DLC)
+    # Convert global frame number to batch-relative index (like working script)
+    batch_relative_frame_number = frame_number - (batch_number * batch_size)
+    
+    # Prepare points and labels like the working script
+    points_list = []
+    labels_list = []
+    
     for bodypart, coords in coordinates.items():
         for x, y in coords:
             print(f"Adding point for {bodypart}: ({x:.2f}, {y:.2f})")
+            points_list.append([x, y])
+            labels_list.append(1)
 
-            _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=frame_number,
-                obj_id=0,  # Use obj_id=0 like the old working script
-                points=np.array([[x, y]], dtype=np.float32),
-                labels=np.array([1], dtype=np.int32)
-            )
+    # Convert lists to numpy arrays
+    points = np.array(points_list, dtype=np.float32)
+    labels = np.array(labels_list, dtype=np.int32)
+    
+    print("Points array:", points)
+    print("Labels array:", labels)
 
-    # Propagate masks through the video
+    # Add points to model using batch-relative frame number
+    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+        inference_state=inference_state,
+        frame_idx=batch_relative_frame_number,  # Use batch-relative index
+        obj_id=0,
+        points=points,
+        labels=labels,
+    )
+    
+    print("Added point to the model")
+
+    # Dictionary to store masks for video frames
     video_segments = {}
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-        video_segments[out_frame_idx] = {
-            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-            for i, out_obj_id in enumerate(out_obj_ids)
-        }
+    print("Propagating masklet through video frames (forward direction):")
 
-    # Extract binary masks
-    masks = {}
-    for frame_idx, obj_masks in video_segments.items():
-        if 0 in obj_masks:  # Changed from 1 to 0 to match obj_id
-            binary_mask = obj_masks[0].squeeze()
-            masks[frame_idx] = binary_mask
+    # Forward propagation (reverse=False)
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=False):
+        for i, out_obj_id in enumerate(out_obj_ids):
+            # Generate mask from logits
+            mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+
+            # Remove the extra channel dimension if present
+            mask = np.squeeze(mask)
+            
+            # Check if the mask is 2D (binary mask) and proceed
+            if len(mask.shape) == 2:
+                # Convert mask to binary (0 or 255)
+                binary_mask = (mask * 255).astype(np.uint8)
+                
+                # Show unique values and shape of the binary mask
+                print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
+                
+                # Add the binary mask to video_segments
+                video_segments[out_frame_idx] = binary_mask
+                print(f"Processed frame {out_frame_idx}")
+            else:
+                # Create a black mask (all zeros) with the same width and height as the original mask
+                black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
+                
+                # Add the black mask to video_segments
+                video_segments[out_frame_idx] = black_mask
+                print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
+
+    # Reverse propagation (reverse=True)
+    print("Propagating masklet through video frames (reverse direction):")
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=True):
+        for i, out_obj_id in enumerate(out_obj_ids):
+            # Generate mask from logits
+            mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+
+            # Remove the extra channel dimension if present
+            mask = np.squeeze(mask)
+            
+            # Check if the mask is 2D (binary mask) and proceed
+            if len(mask.shape) == 2:
+                # Convert mask to binary (0 or 255)
+                binary_mask = (mask * 255).astype(np.uint8)
+                
+                # Show unique values and shape of the binary mask
+                print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
+                
+                # Add the binary mask to video_segments
+                video_segments[out_frame_idx] = binary_mask
+                print(f"Processed frame {out_frame_idx}")
+            else:
+                # Create a black mask (all zeros) with the same width and height as the original mask
+                black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
+                
+                # Add the black mask to video_segments
+                video_segments[out_frame_idx] = black_mask
+                print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
+
+    # Sort the dictionary to ensure the frames are in proper order
+    video_segments = dict(sorted(video_segments.items()))
 
     # Clean up inference state
     predictor.reset_state(inference_state)
 
-    return masks
+    return video_segments
 
 
 # ============================================================================
