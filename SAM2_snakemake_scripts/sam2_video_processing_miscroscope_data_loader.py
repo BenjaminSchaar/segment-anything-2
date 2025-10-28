@@ -512,16 +512,27 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
     inference_state["tracking_has_started"] = False
     inference_state["frames_already_tracked"] = {}
     
-    # Warm up the visual backbone and cache the image feature on frame 0
-    predictor._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+    # CRITICAL FIX: Do NOT call _get_image_feature here!
+    # The old working script doesn't call this, and it causes a hang.
+    # SAM2 will call it internally when needed.
 
-    # Add points for each body part
+    print("Initialized inference state with lazy video provider")
+
+    # NOTE: Coordinate scaling is NOT needed!
+    # SAM2 handles it automatically based on:
+    # - inference_state["video_height/width"] = original dimensions (e.g., 150×150)
+    # - Frame tensor shape = resized dimensions (1024×1024)
+    # SAM2 scales coordinates internally, so we pass them as-is from DLC
+
+    # Add points for each body part (coordinates as-is from DLC)
     for bodypart, coords in coordinates.items():
         for x, y in coords:
+            print(f"Adding point for {bodypart}: ({x:.2f}, {y:.2f})")
+
             _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
                 inference_state=inference_state,
                 frame_idx=frame_number,
-                obj_id=1,
+                obj_id=0,  # Use obj_id=0 like the old working script
                 points=np.array([[x, y]], dtype=np.float32),
                 labels=np.array([1], dtype=np.int32)
             )
@@ -537,8 +548,8 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
     # Extract binary masks
     masks = {}
     for frame_idx, obj_masks in video_segments.items():
-        if 1 in obj_masks:
-            binary_mask = obj_masks[1].squeeze()
+        if 0 in obj_masks:  # Changed from 1 to 0 to match obj_id
+            binary_mask = obj_masks[0].squeeze()
             masks[frame_idx] = binary_mask
 
     # Clean up inference state
