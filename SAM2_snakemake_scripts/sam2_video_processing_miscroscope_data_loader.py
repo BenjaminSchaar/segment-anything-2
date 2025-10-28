@@ -677,161 +677,161 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
 # ============================================================================
 
 def main(args=None):
-    """Main processing function."""
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='SAM2 TIFF/BTF Lazy Video Processing Pipeline')
-    parser.add_argument('-tiff_path', type=str, required=True,
-                       help='Path to the input TIFF/BTF file or folder')
-    parser.add_argument('-output_file_path', type=str, required=True,
-                       help='Path to the output TIFF file')
-    parser.add_argument('-DLC_csv_file_path', type=str, required=True,
-                       help='Path to the DeepLabCut CSV file')
-    parser.add_argument('-column_names', type=str, required=True,
-                       help='Comma-separated list of body part column names')
-    parser.add_argument('-SAM2_path', type=str, required=True,
-                       help='Path to the SAM2 model directory')
-    parser.add_argument('--batch_size', type=int, default=400,
-                       help='Number of frames per batch')
-    parser.add_argument('--device', type=str, default='0',
-                       help='CUDA device ID')
+    """Main processing function — lazy read + streaming write to single BigTIFF (.btf)."""
+    import sys
+    import gc
+    import os
+    from pathlib import Path
+    import argparse
+    import torch
+    import tifffile as tiff
 
+    # --- parse CLI ---
+    parser = argparse.ArgumentParser(description='SAM2 TIFF/BTF Lazy Video Processing Pipeline (stream to BigTIFF)')
+    parser.add_argument('-tiff_path', type=str, required=True,
+                        help='Path to the input TIFF/BTF file or folder')
+    parser.add_argument('-output_file_path', type=str, required=True,
+                        help='Output .btf (BigTIFF) path')
+    parser.add_argument('-DLC_csv_file_path', type=str, required=True,
+                        help='Path to the DeepLabCut CSV file')
+    parser.add_argument('-column_names', type=str, required=True,
+                        help='Comma-separated list of body part column names')
+    parser.add_argument('-SAM2_path', type=str, required=True,
+                        help='Path to the SAM2 model directory')
+    parser.add_argument('--batch_size', type=int, default=400,
+                        help='Number of frames per batch')
+    parser.add_argument('--device', type=str, default='0',
+                        help='CUDA device ID')
     args = parser.parse_args(args)
 
-    # DEBUG: Show input path
+    # --- debug / echo inputs ---
     print(f"\n{'='*60}")
-    print(f"DEBUG: Input TIFF/BTF path: {args.tiff_path}")
+    print(f"DEBUG: Input path: {args.tiff_path}")
+    print(f"DEBUG: DLC CSV    : {args.DLC_csv_file_path}")
+    print(f"DEBUG: Output BTF : {args.output_file_path}")
     print(f"DEBUG: Using MicroscopeDataReader for lazy loading")
     print(f"{'='*60}\n")
 
-    # Parse column names
+    # --- quick input validation ---
+    in_path = Path(args.tiff_path)
+    if not (in_path.is_file() or in_path.is_dir()):
+        raise FileNotFoundError(f"-tiff_path not found: {args.tiff_path}")
+    if in_path.is_file() and in_path.suffix.lower() not in {'.tif', '.tiff', '.btf'}:
+        raise ValueError(f"-tiff_path expects TIFF/BTF (got {in_path.suffix}).")
+
+    out_path = Path(args.output_file_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- parse columns ---
     column_names = [name.strip() for name in args.column_names.split(',')]
 
-    # Set CUDA device
+    # --- device selection ---
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"CUDA available. GPU {i}: {torch.cuda.get_device_name(i)}")
+    else:
+        print("CUDA not available. Using CPU.")
     print(f"Using device: {device}")
 
-    # Initialize SAM2
+    # --- SAM2 init ---
     print("Initializing SAM2 model...")
     sys.path.append(args.SAM2_path)
     from sam2.build_sam import build_sam2_video_predictor
-
-    # Use exact same paths as the old working script
     sam2_checkpoint = os.path.join(args.SAM2_path, "checkpoints", "sam2_hiera_large.pt")
-    model_cfg = "/" + os.path.join(args.SAM2_path, "sam2_configs", "sam2_hiera_l.yaml")
-
+    model_cfg = os.path.join(args.SAM2_path, "sam2_configs", "sam2_hiera_l.yaml")
     predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
     print("SAM2 model loaded successfully")
 
-    # Read DLC data
+    # --- DLC load ---
     print(f"Reading DLC CSV: {args.DLC_csv_file_path}")
     DLC_data = read_DLC_csv(args.DLC_csv_file_path)
-
-    # Get total number of frames from DLC data
     total_frames = len(DLC_data)
     print(f"Total frames in DLC data: {total_frames}")
 
-    # Calculate number of batches
+    # --- batches ---
     num_batches = (total_frames + args.batch_size - 1) // args.batch_size
     print(f"Processing {num_batches} batches with batch size {args.batch_size}")
 
-    # Dictionary to store all masks
-    final_mask_dict = {}
+    # --- streaming BigTIFF writer: open once, append pages as we go ---
+    print("\n" + "="*60)
+    print("Saving masks to single BigTIFF (.btf) — streaming one frame at a time...")
+    print("="*60)
 
-    # Process each batch with lazy loading
-    print("Using lazy TIFF/BTF loading")
+    # overwrite existing output if present
+    if out_path.exists():
+        out_path.unlink()
 
-    for batch_number in range(num_batches):
-        batch_start = batch_number * args.batch_size
-        batch_end = min(batch_start + args.batch_size, total_frames)
-        current_batch_size = batch_end - batch_start
+    with tiff.TiffWriter(out_path.as_posix(), bigtiff=True) as tif_writer:
 
-        print(f"\n{'='*60}")
-        print(f"Processing Batch {batch_number + 1}/{num_batches}")
-        print(f"Frames: {batch_start} to {batch_end - 1} (size: {current_batch_size})")
-        print(f"{'='*60}")
+        print("Using lazy TIFF/BTF loading")
 
-        # GPU memory monitoring - batch start
-        print_gpu_memory(f"[Lazy Batch {batch_number}] Start - ")
+        for batch_number in range(num_batches):
+            batch_start = batch_number * args.batch_size
+            batch_end = min(batch_start + args.batch_size, total_frames)
+            current_batch_size = batch_end - batch_start
 
-        try:
-            # Create lazy video provider for this batch
+            print(f"\n{'='*60}")
+            print(f"Processing Batch {batch_number + 1}/{num_batches}")
+            print(f"Frames: {batch_start} to {batch_end - 1} (size: {current_batch_size})")
+            print(f"{'='*60}")
+
+            print_gpu_memory(f"[Lazy Batch {batch_number}] Start - ")
+
+            # lazy provider for this batch
             video_provider = create_lazy_video_provider(
                 tiff_path=args.tiff_path,
                 batch_start_frame=batch_start,
                 batch_size=current_batch_size,
-                image_size=1024,  # SAM2 standard size
-                device=device
+                image_size=1024,  # SAM2 standard
+                device=device,
             )
+            if video_provider.video_height is None:
+                video_provider._initialize_microscope_reader()
 
-            # Slice the DataFrame for the current batch
+            # slice DLC for batch & pick coordinates
             DLC_data_batch = DLC_data.iloc[batch_start:batch_end]
-
-            # Extract coordinates and frame numbers for the current batch
             coordinates, frame_number = extract_coordinate_by_likelihood(DLC_data_batch, column_names)
             print(f"Selected frame {frame_number} for annotation in batch {batch_number}")
 
-            # Generate masks for the current batch
+            # segment + propagate
             print(f"Generating masks for batch {batch_number}...")
-            masks = segment_object_lazy(predictor, video_provider, coordinates,
-                                       frame_number, batch_number, current_batch_size)
+            masks = segment_object_lazy(
+                predictor=predictor,
+                video_provider=video_provider,
+                coordinates=coordinates,
+                frame_number=frame_number,
+                batch_number=batch_number,
+                batch_size=current_batch_size,
+            )
             print(f"Masks generated for batch {batch_number}. Number of masks: {len(masks)}")
 
-            # Concatenate masks into the final dictionary with global frame indexing
-            for out_frame_idx, binary_mask in masks.items():
+            # --- stream masks directly into the BigTIFF ---
+            # NOTE: 'contiguous=True' is okay since all masks share shape & dtype.
+            #       You can also add compression='zlib' if you like smaller files.
+            for out_frame_idx in sorted(masks.keys()):
                 global_frame_idx = out_frame_idx + batch_start
-                final_mask_dict[global_frame_idx] = binary_mask
+                processed_mask = process_mask(masks[out_frame_idx])  # 2D uint8
+                tif_writer.write(
+                    processed_mask,
+                    contiguous=True,
+                    # compression='zlib',  # optional: enable if you want compression
+                    description=f"GlobalFrameIndex={int(global_frame_idx)};Batch={int(batch_number)}",
+                )
 
-            # Print cache statistics
+            # cache stats
             stats = video_provider.get_stats()
-            print(f"Cache stats - Hits: {stats['cache_hits']}, "
-                  f"Misses: {stats['cache_misses']}, "
-                  f"Hit rate: {stats['hit_rate']:.2%}")
+            print(f"Cache stats - Hits: {stats['cache_hits']}, Misses: {stats['cache_misses']}, Hit rate: {stats['hit_rate']:.2%}")
 
-        except torch.cuda.OutOfMemoryError as e:
-            print(f"[Batch {batch_number}] CUDA OOM Error: {e}")
-            # Emergency memory cleanup
+            # per-batch cleanup
+            video_provider.clear_cache()
+            del video_provider, masks, coordinates, DLC_data_batch
             torch.cuda.empty_cache()
             gc.collect()
-            print_gpu_memory(f"[Batch {batch_number}] After emergency cleanup - ")
-            print(f"[Batch {batch_number}] Skipping batch due to memory issues")
-            continue
-
-        finally:
-            # Cleanup
-            if 'video_provider' in locals():
-                video_provider.clear_cache()
-                del video_provider
-            if 'masks' in locals():
-                del masks
-            if 'coordinates' in locals():
-                del coordinates
-            if 'DLC_data_batch' in locals():
-                del DLC_data_batch
-
-            # Force GPU cache clearing after batch completion
-            torch.cuda.empty_cache()
-            gc.collect()
-
-            # GPU memory monitoring - batch end
             print_gpu_memory(f"[Lazy Batch {batch_number}] End - ")
 
-    # Save all masks to TIFF file
-    print(f"\n{'='*60}")
-    print("Saving masks to TIFF file...")
-    print(f"{'='*60}")
-
-    sorted_mask_keys = sorted(final_mask_dict.keys())
-    print(f"Total number of masks: {len(sorted_mask_keys)}")
-    print(f"Frame indices: {min(sorted_mask_keys)} to {max(sorted_mask_keys)}")
-
-    with tiff.TiffWriter(args.output_file_path, bigtiff=True) as tif_writer:
-        for global_frame_idx in sorted_mask_keys:
-            mask = final_mask_dict[global_frame_idx]
-            processed_mask = process_mask(mask)
-            tif_writer.write(processed_mask, contiguous=True)
-
-    print(f"All masks saved to {args.output_file_path}")
+    print(f"\nAll masks saved to BigTIFF: {out_path}")
     print("Processing complete!")
 
 
@@ -846,7 +846,7 @@ if __name__ == "__main__":
 rule sam2_segment:
     input:
         "{dataset}/{track_dir}/output/.meta.json",
-        avi     = "{dataset}/{track_dir}/output/track.avi",
+        tiff     = "{dataset}/{track_dir}/output/track.tif",
         dlc_csv = "{dataset}/{track_dir}/output/track" + config["network_string"] + "_filtered.csv"
     output:
         mask = "{dataset}/{track_dir}/output/track_mask.btf"
@@ -874,6 +874,6 @@ rule sam2_segment:
         source /lisc/app/conda/miniforge3/bin/activate {params.sam2_conda_env_name}
 
         # Run the script directly without temp directory overhead
-        python -c "from SAM2_snakemake_scripts.sam2_tiff_lazy_processing import main; main(['-tiff_path', '{input.avi}', '-output_file_path', '{output.mask}', '-DLC_csv_file_path', '{input.dlc_csv}', '-column_names', '{params.column_names}', '-SAM2_path', '{params.model_path}', '--batch_size', '{params.batch_size}', '--device', '${{CUDA_VISIBLE_DEVICES:-0}}'])"
+        python -c "from SAM2_snakemake_scripts.sam2_tiff_lazy_processing import main; main(['-tiff_path', '{input.tiff}', '-output_file_path', '{output.mask}', '-DLC_csv_file_path', '{input.dlc_csv}', '-column_names', '{params.column_names}', '-SAM2_path', '{params.model_path}', '--batch_size', '{params.batch_size}', '--device', '${{CUDA_VISIBLE_DEVICES:-0}}'])"
         '''
 """
