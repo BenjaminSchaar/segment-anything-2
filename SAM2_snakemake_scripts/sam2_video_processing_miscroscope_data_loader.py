@@ -353,6 +353,93 @@ def create_lazy_video_provider(
     )
 
 
+def init_state_with_lazy_provider(
+    predictor,
+    video_provider,
+    offload_video_to_cpu=False,
+    offload_state_to_cpu=False,
+):
+    """
+    Initialize an inference state using a LazyVideoProvider.
+
+    This is a 1:1 copy of SAM2VideoPredictor.init_state() but uses lazy loading
+    instead of loading all frames at once with load_video_frames().
+
+    Args:
+        predictor: SAM2VideoPredictor instance
+        video_provider: LazyVideoProvider instance (already initialized)
+        offload_video_to_cpu: Whether to offload video frames to CPU
+        offload_state_to_cpu: Whether to offload inference state to CPU
+
+    Returns:
+        inference_state dict ready for SAM2 processing
+    """
+    compute_device = predictor.device  # device of the model
+
+    # Make sure video_provider has loaded its properties
+    if video_provider.video_height is None:
+        video_provider._initialize_microscope_reader()
+
+    # Instead of calling load_video_frames(), use the lazy provider directly
+    images = video_provider
+    video_height = video_provider.video_height
+    video_width = video_provider.video_width
+
+    # Everything below is a 1:1 copy from SAM2VideoPredictor.init_state()
+    inference_state = {}
+    inference_state["images"] = images
+    inference_state["num_frames"] = len(images)
+    # whether to offload the video frames to CPU memory
+    # turning on this option saves the GPU memory with only a very small overhead
+    inference_state["offload_video_to_cpu"] = offload_video_to_cpu
+    # whether to offload the inference state to CPU memory
+    # turning on this option saves the GPU memory at the cost of a lower tracking fps
+    # (e.g. in a test case of 768x768 model, fps dropped from 27 to 24 when tracking one object
+    # and from 24 to 21 when tracking two objects)
+    inference_state["offload_state_to_cpu"] = offload_state_to_cpu
+    # the original video height and width, used for resizing final output scores
+    inference_state["video_height"] = video_height
+    inference_state["video_width"] = video_width
+    inference_state["device"] = compute_device
+    if offload_state_to_cpu:
+        inference_state["storage_device"] = torch.device("cpu")
+    else:
+        inference_state["storage_device"] = compute_device
+    # inputs on each frame
+    inference_state["point_inputs_per_obj"] = {}
+    inference_state["mask_inputs_per_obj"] = {}
+    # visual features on a small number of recently visited frames for quick interactions
+    inference_state["cached_features"] = {}
+    # values that don't change across frames (so we only need to hold one copy of them)
+    inference_state["constants"] = {}
+    # mapping between client-side object id and model-side object index
+    inference_state["obj_id_to_idx"] = OrderedDict()
+    inference_state["obj_idx_to_id"] = OrderedDict()
+    inference_state["obj_ids"] = []
+    # A storage to hold the model's tracking results and states on each frame
+    inference_state["output_dict"] = {
+        "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+        "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+    }
+    # Slice (view) of each object tracking results, sharing the same memory with "output_dict"
+    inference_state["output_dict_per_obj"] = {}
+    # A temporary storage to hold new outputs when user interact with a frame
+    # to add clicks or mask (it's merged into "output_dict" before propagation starts)
+    inference_state["temp_output_dict_per_obj"] = {}
+    # Frames that already holds consolidated outputs from click or mask inputs
+    # (we directly use their consolidated outputs during tracking)
+    inference_state["consolidated_frame_inds"] = {
+        "cond_frame_outputs": set(),  # set containing frame indices
+        "non_cond_frame_outputs": set(),  # set containing frame indices
+    }
+    # metadata for each tracking frame (e.g. which direction it's tracked)
+    inference_state["tracking_has_started"] = False
+    inference_state["frames_already_tracked"] = {}
+    # Warm up the visual backbone and cache the image feature on frame 0
+    predictor._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+    return inference_state
+
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
@@ -471,45 +558,26 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
     Returns:
         Dictionary mapping frame indices to binary masks
     """
-    # Use SAM2's proper initialization method by patching the load_video_frames function
-    import tempfile
-    import os
-    from collections import OrderedDict
-    from sam2.utils import misc
-    
     # Ensure video provider has the required properties initialized
     if video_provider.video_height is None:
         video_provider._initialize_microscope_reader()
-    
-    # Store the original load_video_frames function
-    original_load_video_frames = misc.load_video_frames
-    
-    def patched_load_video_frames(video_path, image_size, offload_video_to_cpu, 
-                                 img_mean=(0.485, 0.456, 0.406),
-                                 img_std=(0.229, 0.224, 0.225),
-                                 async_loading_frames=False,
-                                 compute_device=torch.device("cuda")):
-        """Patched version that returns our lazy video provider instead of loading JPEG files."""
-        return video_provider, video_provider.video_height, video_provider.video_width
-    
-    # Temporarily replace the load_video_frames function
-    misc.load_video_frames = patched_load_video_frames
-    
-    try:
-        # Use SAM2's proper init_state with a dummy path (won't be used due to patch)
-        inference_state = predictor.init_state(video_path="dummy_path")
-        print("Initialized inference state with lazy video provider using SAM2's init_state")
-    finally:
-        # Restore the original function to not break other functionality
-        misc.load_video_frames = original_load_video_frames
+
+    # Use our custom init function instead of monkey-patching
+    inference_state = init_state_with_lazy_provider(
+        predictor=predictor,
+        video_provider=video_provider,
+        offload_video_to_cpu=False,
+        offload_state_to_cpu=False
+    )
+    print("Initialized inference state with lazy video provider")
 
     # Convert global frame number to batch-relative index (like working script)
     batch_relative_frame_number = frame_number - (batch_number * batch_size)
-    
+
     # Prepare points and labels like the working script
     points_list = []
     labels_list = []
-    
+
     for bodypart, coords in coordinates.items():
         for x, y in coords:
             print(f"Adding point for {bodypart}: ({x:.2f}, {y:.2f})")
@@ -519,7 +587,7 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
     # Convert lists to numpy arrays
     points = np.array(points_list, dtype=np.float32)
     labels = np.array(labels_list, dtype=np.int32)
-    
+
     print("Points array:", points)
     print("Labels array:", labels)
 
@@ -531,7 +599,7 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
         points=points,
         labels=labels,
     )
-    
+
     print("Added point to the model")
 
     # Dictionary to store masks for video frames
@@ -546,22 +614,22 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
 
             # Remove the extra channel dimension if present
             mask = np.squeeze(mask)
-            
+
             # Check if the mask is 2D (binary mask) and proceed
             if len(mask.shape) == 2:
                 # Convert mask to binary (0 or 255)
                 binary_mask = (mask * 255).astype(np.uint8)
-                
+
                 # Show unique values and shape of the binary mask
                 print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
-                
+
                 # Add the binary mask to video_segments
                 video_segments[out_frame_idx] = binary_mask
                 print(f"Processed frame {out_frame_idx}")
             else:
                 # Create a black mask (all zeros) with the same width and height as the original mask
                 black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
-                
+
                 # Add the black mask to video_segments
                 video_segments[out_frame_idx] = black_mask
                 print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
@@ -575,22 +643,22 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
 
             # Remove the extra channel dimension if present
             mask = np.squeeze(mask)
-            
+
             # Check if the mask is 2D (binary mask) and proceed
             if len(mask.shape) == 2:
                 # Convert mask to binary (0 or 255)
                 binary_mask = (mask * 255).astype(np.uint8)
-                
+
                 # Show unique values and shape of the binary mask
                 print(f"Binary mask for frame {out_frame_idx} has unique values: {np.unique(binary_mask)} and shape: {binary_mask.shape}")
-                
+
                 # Add the binary mask to video_segments
                 video_segments[out_frame_idx] = binary_mask
                 print(f"Processed frame {out_frame_idx}")
             else:
                 # Create a black mask (all zeros) with the same width and height as the original mask
                 black_mask = np.zeros(mask.shape[1:], dtype=np.uint8)
-                
+
                 # Add the black mask to video_segments
                 video_segments[out_frame_idx] = black_mask
                 print(f"Non-2D mask for frame {out_frame_idx}. Added black mask instead.")
