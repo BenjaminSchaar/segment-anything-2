@@ -543,7 +543,7 @@ def process_mask(mask):
 # SAM2 SEGMENTATION FUNCTION
 # ============================================================================
 
-def segment_object_lazy(predictor, video_provider, coordinates, frame_number, batch_number, batch_size):
+def segment_object_lazy(predictor, video_provider, coordinates, frame_number, batch_start, batch_size):
     """
     Generate segmentation masks using SAM2 with lazy video provider.
 
@@ -551,8 +551,8 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
         predictor: SAM2 predictor instance
         video_provider: LazyVideoProvider instance
         coordinates: Dictionary of body part coordinates
-        frame_number: Frame index for initial annotation
-        batch_number: Current batch number
+        frame_number: Frame index for initial annotation (global frame index)
+        batch_start: Starting frame index for this batch (global frame index)
         batch_size: Number of frames in batch
 
     Returns:
@@ -571,8 +571,8 @@ def segment_object_lazy(predictor, video_provider, coordinates, frame_number, ba
     )
     print("Initialized inference state with lazy video provider")
 
-    # Convert global frame number to batch-relative index (like working script)
-    batch_relative_frame_number = frame_number - (batch_number * batch_size)
+    # Convert global frame number to batch-relative index
+    batch_relative_frame_number = frame_number - batch_start
 
     # Prepare points and labels like the working script
     points_list = []
@@ -802,7 +802,7 @@ def main(args=None):
                 video_provider=video_provider,
                 coordinates=coordinates,
                 frame_number=frame_number,
-                batch_number=batch_number,
+                batch_start=batch_start,
                 batch_size=current_batch_size,
             )
             print(f"Masks generated for batch {batch_number}. Number of masks: {len(masks)}")
